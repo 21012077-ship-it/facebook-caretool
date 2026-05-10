@@ -1,0 +1,7 @@
+data/
+cookies/
+logs/
+accounts.json
+accounts.json.bak
+__pycache__/
+*.pyc
