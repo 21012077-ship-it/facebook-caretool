@@ -8,6 +8,7 @@ from services.secure_store import SecureAccountStore
 from services.log_service import LogService
 from services.task_control import TaskControl
 from services.cookie_service import CookieService
+from services.backup_service import BackupService
 from services.browser_service import BrowserService
 from services.comment_service import CommentCampaignService
 from utils.validators import (
@@ -29,6 +30,7 @@ class FacebookCareTool(ctk.CTk):
         self.store = SecureAccountStore()
         self.logs = LogService()
         self.cookies = CookieService()
+        self.backups = BackupService()
         self.control = TaskControl()
         self.browser_service = BrowserService(self.logs, ui_log=lambda m: self.after(0, lambda: self.append_live_log(m)))
         self.comment_service = CommentCampaignService(self.browser_service, self.logs, ui_log=lambda m: self.after(0, lambda: self.append_live_log(m)))
@@ -104,7 +106,9 @@ class FacebookCareTool(ctk.CTk):
         self.search_entry = ctk.CTkEntry(header, width=260, height=40, placeholder_text="Tìm kiếm...")
         self.search_entry.grid(row=0, column=1, padx=8)
         self.search_entry.bind("<KeyRelease>", lambda e: self.refresh_accounts())
-        ctk.CTkButton(header, text="+ Thêm", height=40, command=self.add_account_popup).grid(row=0, column=2)
+        ctk.CTkButton(header, text="Backup", height=40, fg_color="#0d9488", command=self.export_backup).grid(row=0, column=2, padx=4)
+        ctk.CTkButton(header, text="Import", height=40, fg_color="#7c3aed", command=self.import_backup).grid(row=0, column=3, padx=4)
+        ctk.CTkButton(header, text="+ Thêm", height=40, command=self.add_account_popup).grid(row=0, column=4, padx=(4, 0))
 
         controls = ctk.CTkFrame(self.view_care, fg_color="transparent")
         controls.grid(row=1, column=0, columnspan=2, sticky="ew", padx=25, pady=5)
@@ -248,6 +252,63 @@ class FacebookCareTool(ctk.CTk):
             f"Lần nuôi cuối: {acc.get('last_care','Chưa nuôi')}"
         ))
         self.refresh_accounts()
+
+
+    def export_backup(self):
+        if not self.accounts:
+            return messagebox.showwarning("Backup", "Chưa có tài khoản nào để backup.")
+        if not messagebox.askyesno(
+            "Backup dữ liệu",
+            "File backup sẽ chứa UID, mật khẩu, 2FA, proxy và cookie. Hãy lưu file ở nơi an toàn. Tiếp tục?",
+        ):
+            return
+        default_name = f"facebook-caretool-backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}.fbcarebackup"
+        path = filedialog.asksaveasfilename(
+            title="Lưu file backup",
+            defaultextension=".fbcarebackup",
+            initialfile=default_name,
+            filetypes=[("Facebook Care backup", "*.fbcarebackup"), ("JSON", "*.json"), ("All", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            result = self.backups.export_backup(self.accounts, path)
+            self.append_live_log(f"Đã backup {result['accounts']} tài khoản vào {Path(result['path']).name}.")
+            messagebox.showinfo("Backup", f"Đã backup {result['accounts']} tài khoản vào:\n{result['path']}")
+        except Exception as e:
+            messagebox.showerror("Lỗi backup", str(e))
+
+    def import_backup(self):
+        path = filedialog.askopenfilename(
+            title="Chọn file backup",
+            filetypes=[("Facebook Care backup", "*.fbcarebackup"), ("JSON", "*.json"), ("All", "*.*")],
+        )
+        if not path:
+            return
+        if not messagebox.askyesno(
+            "Import backup",
+            "Import sẽ thêm tài khoản mới và cập nhật tài khoản trùng UID/tên từ file backup. Tiếp tục?",
+        ):
+            return
+        try:
+            result = self.backups.import_backup(path, self.accounts)
+            self.accounts = result["accounts"]
+            self.selected_index = None
+            self.selected_accounts.clear()
+            self.comment_selected_accounts.clear()
+            self.save_accounts()
+            self.refresh_accounts()
+            self.refresh_comment_accounts()
+            self.refresh_cookie_accounts()
+            self.append_live_log(
+                f"Đã import backup: thêm {result['added']}, cập nhật {result['updated']}, khôi phục {result['restored_cookies']} cookie."
+            )
+            messagebox.showinfo(
+                "Import backup",
+                f"Hoàn tất import.\nThêm mới: {result['added']}\nCập nhật: {result['updated']}\nCookie khôi phục: {result['restored_cookies']}",
+            )
+        except Exception as e:
+            messagebox.showerror("Lỗi import", str(e))
 
     def add_account_popup(self, edit_index=None):
         popup = ctk.CTkToplevel(self); popup.title("Thêm/Sửa tài khoản"); popup.geometry("500x600"); popup.grab_set()
