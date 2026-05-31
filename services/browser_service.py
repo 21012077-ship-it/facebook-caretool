@@ -1,6 +1,7 @@
 import time
 import random
 from pathlib import Path
+from urllib.parse import urlparse
 from playwright.sync_api import sync_playwright
 from playwright_stealth import stealth_sync
 from config import DEFAULT_USER_AGENT, DEFAULT_VIEWPORT
@@ -60,6 +61,73 @@ class BrowserService:
         
         return browser, context, page
 
+
+    def _is_login_url(self, url: str) -> bool:
+        path = urlparse(url).path.lower()
+        return "/login" in path
+
+    def _is_two_step_url(self, url: str) -> bool:
+        path = urlparse(url).path.lower()
+        return "two_step" in path or "two_factor" in path
+
+    def _is_checkpoint_url(self, url: str) -> bool:
+        """Detect real checkpoint pages without treating ?checkpoint_src=any as a checkpoint."""
+        path = urlparse(url).path.lower()
+        return "/checkpoint" in path
+
+    def _is_auth_blocked_url(self, url: str) -> bool:
+        return self._is_login_url(url) or self._is_checkpoint_url(url) or self._is_two_step_url(url)
+
+    def _has_captcha_challenge(self, page) -> bool:
+        url = page.url.lower()
+        if "captcha" in url or "/security/" in url:
+            return True
+
+        selectors = [
+            'iframe[src*="captcha" i]',
+            'iframe[title*="captcha" i]',
+            'input[name*="captcha" i]',
+            'input[id*="captcha" i]',
+            '[data-testid*="captcha" i]',
+        ]
+        for selector in selectors:
+            try:
+                if page.locator(selector).count() > 0:
+                    return True
+            except Exception:
+                continue
+
+        try:
+            body_text = page.locator("body").inner_text(timeout=2000).lower()
+        except Exception:
+            return False
+
+        indicators = [
+            "captcha",
+            "security check",
+            "enter the characters you see",
+            "kiểm tra bảo mật",
+            "nhập các ký tự",
+        ]
+        return any(indicator in body_text for indicator in indicators)
+
+    def _wait_for_captcha_resolution(self, page, uid: str, timeout_seconds: int = 60) -> bool:
+        if not self._has_captcha_challenge(page):
+            return True
+
+        self.ui_log(f"[{uid}] Phát hiện captcha, chờ xác minh trong {timeout_seconds}s...")
+        deadline = time.time() + timeout_seconds
+        while time.time() < deadline:
+            if page.is_closed():
+                return False
+            if not self._has_captcha_challenge(page):
+                self.ui_log(f"[{uid}] Captcha đã được xác minh, tiếp tục đăng nhập...")
+                return True
+            time.sleep(1)
+
+        self.ui_log(f"[{uid}] Captcha chưa được xác minh sau {timeout_seconds}s, đóng trình duyệt.")
+        return False
+
     def check_cookie(self, account: dict) -> tuple[bool, str]:
         browser = None
         try:
@@ -67,7 +135,7 @@ class BrowserService:
                 browser, context, page = self.launch_page(p, account)
                 page.goto("https://m.facebook.com/", wait_until="domcontentloaded", timeout=30000)
                 time.sleep(2)
-                ok = "login" not in page.url and "checkpoint" not in page.url and "two_step" not in page.url
+                ok = not self._is_auth_blocked_url(page.url)
                 return ok, page.url
         finally:
             if browser:
@@ -80,7 +148,7 @@ class BrowserService:
 
         page.goto("https://m.facebook.com/", wait_until="domcontentloaded", timeout=30000)
         time.sleep(2)
-        if "login" not in page.url and "checkpoint" not in page.url and "two_step_verification" not in page.url:
+        if not self._is_auth_blocked_url(page.url):
             return True
         if not uid or not password:
             account["status"] = "cookie_error"
@@ -92,6 +160,10 @@ class BrowserService:
         page.locator('input[name="pass"], input[id="pass"]').first.fill(password)
         page.locator('input[name="pass"], input[id="pass"]').first.press("Enter")
         time.sleep(7)
+
+        if not self._wait_for_captcha_resolution(page, uid, timeout_seconds=60):
+            account["status"] = "checkpoint"
+            raise RuntimeError("Captcha chưa được xác minh sau 60 giây.")
 
         # Regular 2FA handling, not stealth/evasion.
         code = get_2fa_code(two_fa)
@@ -109,7 +181,7 @@ class BrowserService:
             except Exception as e:
                 self.ui_log(f"[{uid}] Không nhập được 2FA tự động: {e}")
 
-        if "login" in page.url or "checkpoint" in page.url or "two_step_verification" in page.url:
+        if self._is_auth_blocked_url(page.url):
             account["status"] = "checkpoint"
             raise RuntimeError("Đăng nhập thất bại hoặc dính checkpoint/2FA.")
 
